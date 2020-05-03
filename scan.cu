@@ -39,17 +39,19 @@ __global__ void parallel_reduc_2(int *data){
 }
 
 __global__ void parallel_reduc_3(int *data, int *out, int *values){
-    extern __shared__ float chunk_data[1024];
+    __shared__ float chunk_data[1024];
 
-    int start = blockDim.x * blockIdx.x + threadIdx.x;
+    int start = 1024 * blockIdx.x;
     int tid = threadIdx.x;
-    int indx = start*2+1;
     int gap = 1;
-    int start_size = *values >> 1;
+    int start_size = 1024 >> 1;
 
-    chunk_data[2*tid] = data[2*tid];
-    chunk_data[2*tid+1] = data[2*tid+1];
-//    out[indx] = data[indx] + data[indx-gap];
+//    out[start+(2*tid)] = 1; // for testing
+//    out[start+(2*tid+1)] = 2;
+
+    chunk_data[2*tid] = data[start+(2*tid)];
+    chunk_data[2*tid+1] = data[start+(2*tid+1)];
+
     for (int span=start_size; span>0; span>>=1){
         __syncthreads();
         if (tid < span){
@@ -61,19 +63,35 @@ __global__ void parallel_reduc_3(int *data, int *out, int *values){
         gap = gap * 2;
     }
     __syncthreads();
-    out[2*tid] = chunk_data[2*tid];
-    out[2*tid+1] = chunk_data[2*tid+1];
-//    out[2*tid] = 1;
-//    out[2*tid+1] = 2;
+    out[start+(2*tid)] = chunk_data[2*tid];
+    out[start+(2*tid+1)] = chunk_data[2*tid+1];
+
+    // do it again in global
+    if (blockIdx.x == 0){
+        gap = 1;
+
+        chunk_data[2*tid] = data[2*tid*1024];
+        chunk_data[2*tid+1] = data[(2*tid+1)*1024];
+
+        for (int span=start_size; span>0; span>>=1){
+            __syncthreads();
+            if (tid < span){
+                int from = gap*(2*tid+1)-1;
+                int to = gap*(2*tid+2)-1;
+
+                chunk_data[to] += chunk_data[from];
+            }
+            gap = gap * 2;
+        }
+    }
+    out[2*tid*1024] = chunk_data[2*tid];
+    out[(2*tid+1)*1024] = chunk_data[2*tid+1];
 }
 
-__global__ void up_sweep(int *data,int *output, int *values){
+__global__ void down_sweep(int *data,int *output, int *values){
 
 }
 
-// write result for this block to global mem
-    if (tid == 0) g_odata[blockIdx.x] = sdata[0];
-}
 
 int * serial_implementation(int * data, int vals) {
     int * output = (int *)malloc(sizeof(int) * vals);
@@ -119,9 +137,10 @@ int main(int argc, char ** argv) {
     int * h_output = (int *)malloc(sizeof(int) * values); // THIS VARIABLE SHOULD HOLD THE TOTAL COUNT BY THE END
 
     // PERFORM NECESSARY VARIABLE DECLARATIONS HERE
-    int *data_p, *values_p;
+    int *data_p, *values_p, *intermediate;
     cudaMallocManaged(&values_p, sizeof(int));
     cudaMallocManaged(&data_p, z_values * sizeof(int));
+    cudaMallocManaged(&intermediate, z_values * sizeof(int));
     cudaMallocManaged(&h_output, z_values * sizeof(int));
 
     // PERFORM NECESSARY DATA TRANSFER HERE
@@ -129,7 +148,7 @@ int main(int argc, char ** argv) {
     for (int i=0; i<z_values; i++){
         data_p[i] = data[i];
 //        h_output[i] = data[i];
-        h_output[i] = 0;
+//        h_output[i] = 0;
     }
 
     cudaEventRecord(begin, stream);
@@ -145,7 +164,8 @@ int main(int argc, char ** argv) {
 //    up_sweep <<<grid_dim, block_dim>>> (data_p, h_output, values_p);
 //    reduce <<<32, 32>>> (data_p, h_output);
 //    parallel_reduc_3 <<<z_values/1024, 512>>> (data_p, h_output, values_p);
-    parallel_reduc_3 <<<1, 512>>> (data_p, h_output, values_p);
+    parallel_reduc_3 <<<z_values/1024, 512>>> (data_p, intermediate, values_p);
+//    down_sweep <<<z_values/1024, 512>>> (intermediate, h_output, values_p);
     cudaEventRecord(end, stream);
 
     /* 
@@ -159,10 +179,11 @@ int main(int argc, char ** argv) {
         printf("data: %i\n", data[i]);
     }
     for (int i=0; i<15; i++){
-        printf("out: %i\n", h_output[i]);
+        printf("out: %i\n", intermediate[i]);
     }
-    printf("first: %i\n", h_output[0]);
-    printf("last: %i\n", h_output[z_values-1]);
+    printf("first: %i\n", intermediate[0]);
+    printf("last: %i\n", intermediate[values-1]);
+    printf("last: %i\n", intermediate[z_values-1]);
     float ms;
     cudaEventElapsedTime(&ms, begin, end);
     printf("Elapsed time: %f ms\n", ms);
@@ -170,6 +191,7 @@ int main(int argc, char ** argv) {
     //DEALLOCATE RESOURCES HERE
     cudaFree(data_p);
     cudaFree(values_p);
+    cudaFree(intermediate);
 //    cudaFree(h_output);
 
 //    for (int i=0; i<values; i++){
@@ -177,6 +199,8 @@ int main(int argc, char ** argv) {
 //    }
 
     int * reference_output = serial_implementation(data, values);
+    printf("reference last: %i\n", reference_output[values-1]);
+
     for (int i = 0; i < values; i++) {
         if (reference_output[i] != h_output[i]) {
             printf("ERROR: %d != %d at index %d\n", reference_output[i], h_output[i], i);
