@@ -72,8 +72,6 @@ __global__ void scan_block_3(int *data, int *out, int *values, int *block_sums){
 }
 
 __global__ void apply_block_sum(int *data, int *out, int *values, int *block_sums){
-    //__shared__ float chunk_data[1024];
-//    __shared__ int val_to_add;
     int tid = threadIdx.x;
     int start = 1024 * blockIdx.x;
     int ind_a = start+(tid*2);
@@ -91,18 +89,6 @@ __global__ void apply_block_sum(int *data, int *out, int *values, int *block_sum
 
     out[ind_a] = data[ind_a] + val_to_add;
     out[ind_b] = data[ind_b] + val_to_add;
-
-//    // place into shared
-//    chunk_data[2*tid] = data[start+(2*tid)];
-//    chunk_data[2*tid+1] = data[start+(2*tid+1)];
-//    __syncthreads();
-//
-//    chunk_data[]
-//
-//    __syncthreads();
-//    // write back to unified memory
-//    out[start+(2*tid)] = chunk_data[2*tid];
-//    out[start+(2*tid+1)] = chunk_data[2*tid+1];
 }
 
 //__global__ void down_sweep(int *data,int *output, int *values){
@@ -160,8 +146,6 @@ int main(int argc, char ** argv) {
         zeros = 1024 - (blocks % 1024);
     }
     int blocks_padded = blocks + zeros;
-    printf("blocks padded: %i\n", blocks_padded);
-    printf("blocks: %i\n", blocks);
 
     int *data_p, *values_p, *intermediate, *num_blocks, *dummy, *block_sums, *block_sums_scanned, *bb_sums, *bb_sums_scanned, *bb_len, *blocks_intermediate;
 //    int * block_sums = (int *)malloc(sizeof(int) * blocks_padded);
@@ -204,7 +188,6 @@ int main(int argc, char ** argv) {
     cudaDeviceSynchronize();
 
     // scan block sums array
-    printf("blocks padded: %i\n", blocks_padded);
     scan_block_3 <<<blocks_padded/1024, 512>>> (block_sums, block_sums_scanned, num_blocks, bb_sums);
     cudaDeviceSynchronize();
 
@@ -229,15 +212,6 @@ int main(int argc, char ** argv) {
     */
 
     cudaStreamSynchronize(stream);
-    for (int i=0; i<15; i++){
-        printf("data: %i\n", data[i]);
-    }
-    for (int i=61435; i<61451; i++){
-        printf("out: %i\n", h_output[i]);
-    }
-    printf("first: %i\n", h_output[0]);
-    printf("last: %i\n", h_output[values-1]);
-    printf("last: %i\n", h_output[z_values-1]);
     float ms;
     cudaEventElapsedTime(&ms, begin, end);
     printf("Elapsed time: %f ms\n", ms);
@@ -256,7 +230,6 @@ int main(int argc, char ** argv) {
 //    }
 
     int * reference_output = serial_implementation(data, values);
-    printf("reference last: %i\n", reference_output[values-1]);
 
     for (int i = 0; i < values; i++) {
         if (reference_output[i] != h_output[i]) {
