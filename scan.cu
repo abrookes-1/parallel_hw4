@@ -38,7 +38,7 @@ __global__ void parallel_reduc_2(int *data){
     }
 }
 
-__global__ void parallel_reduc_3(int *data, int *out, int *values){
+__global__ void scan_block_3(int *data, int *out, int *values){
     __shared__ float chunk_data[1024];
 
     int start = 1024 * blockIdx.x;
@@ -63,34 +63,35 @@ __global__ void parallel_reduc_3(int *data, int *out, int *values){
         gap = gap * 2;
     }
     __syncthreads();
-    out[start+(2*tid)] = chunk_data[2*tid];
-    out[start+(2*tid+1)] = chunk_data[2*tid+1];
+//    out[start+(2*tid)] = chunk_data[2*tid];
+//    out[start+(2*tid+1)] = chunk_data[2*tid+1];
 
-    // do it again in global
-    if (blockIdx.x == 0){
-        gap = 1;
+    // sweep down tree
+    if (tid == 0){
+        chunk_data[1023] = 0;
+    }
 
-        chunk_data[2*tid] = data[2*tid*1024];
-        chunk_data[2*tid+1] = data[(2*tid+1)*1024];
+    for (int nodes=1; nodes<1024; nodes*=2){
+        gap >>= 1;
+        __syncthreads();
+        if (tid < nodes){
+            int from = gap*(2*tid+1)-1;
+            int to = gap*(2*tid+2)-1;
 
-        for (int span=start_size; span>0; span>>=1){
-            __syncthreads();
-            if (tid < span){
-                int from = gap*(2*tid+1)-1;
-                int to = gap*(2*tid+2)-1;
-
-                chunk_data[to] += chunk_data[from];
-            }
-            gap = gap * 2;
+            int temp = chunk_data[from];
+            chunk_data[from] = chunk_data[to];
+            chunk_data[to] += temp;
         }
     }
-    out[2*tid*1024] = chunk_data[2*tid];
-    out[(2*tid+1)*1024] = chunk_data[2*tid+1];
+    __syncthreads();
+
+    out[start+(2*tid)] = chunk_data[2*tid];
+    out[start+(2*tid+1)] = chunk_data[2*tid+1];
 }
 
-__global__ void down_sweep(int *data,int *output, int *values){
-
-}
+//__global__ void down_sweep(int *data,int *output, int *values){
+//    int
+//}
 
 
 int * serial_implementation(int * data, int vals) {
@@ -135,7 +136,6 @@ int main(int argc, char ** argv) {
     cudaEventCreate(&end);
 
     int * h_output = (int *)malloc(sizeof(int) * values); // THIS VARIABLE SHOULD HOLD THE TOTAL COUNT BY THE END
-
     // PERFORM NECESSARY VARIABLE DECLARATIONS HERE
     int *data_p, *values_p, *intermediate;
     cudaMallocManaged(&values_p, sizeof(int));
@@ -164,7 +164,7 @@ int main(int argc, char ** argv) {
 //    up_sweep <<<grid_dim, block_dim>>> (data_p, h_output, values_p);
 //    reduce <<<32, 32>>> (data_p, h_output);
 //    parallel_reduc_3 <<<z_values/1024, 512>>> (data_p, h_output, values_p);
-    parallel_reduc_3 <<<z_values/1024, 512>>> (data_p, intermediate, values_p);
+    scan_block_3 <<<z_values/1024, 512>>> (data_p, h_output, values_p);
 //    down_sweep <<<z_values/1024, 512>>> (intermediate, h_output, values_p);
     cudaEventRecord(end, stream);
 
@@ -179,11 +179,11 @@ int main(int argc, char ** argv) {
         printf("data: %i\n", data[i]);
     }
     for (int i=0; i<15; i++){
-        printf("out: %i\n", intermediate[i]);
+        printf("out: %i\n", h_output[i]);
     }
-    printf("first: %i\n", intermediate[0]);
-    printf("last: %i\n", intermediate[values-1]);
-    printf("last: %i\n", intermediate[z_values-1]);
+    printf("first: %i\n", h_output[0]);
+    printf("last: %i\n", h_output[values-1]);
+    printf("last: %i\n", h_output[z_values-1]);
     float ms;
     cudaEventElapsedTime(&ms, begin, end);
     printf("Elapsed time: %f ms\n", ms);
@@ -214,7 +214,7 @@ int main(int argc, char ** argv) {
 
     free(data);
     free(reference_output);
-    free(h_output);
+//    free(h_output);
     cudaFree(h_output);
 
     return 0;
