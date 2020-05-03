@@ -10,47 +10,22 @@
 WRITE CUDA KERNEL FOR COUNT HERE
 
 */
-const int reduc_thread_elements = 2;
 
-
-__global__ void parallel_reduc(int *data,int *output, int *values, int *iteration){
-    int start = blockDim.x * blockIdx.x + threadIdx.x;
-    int accumulator = 0;
-    for (int i=0; i<reduc_thread_elements; i++){
-        accumulator += data[start + i];
-    }
-    output[start+reduc_thread_elements-1] = accumulator;
-//    output[];
-}
-
-__global__ void parallel_reduc_2(int *data){
-    int start = blockDim.x * blockIdx.x + threadIdx.x;
-    int tid = threadIdx.x;
-
-    for (int i=blockDim.x/2; i>0; i>>=1){
-        if (tid < i){
-            data[start] += data[start+i];
-        }
-        __syncthreads();
-    }
-    if (tid == 0){
-        data[blockIdx.x] = data[start];
-    }
-}
-
-__global__ void scan_block_3(int *data, int *out, int *values){
-    __shared__ float chunk_data[1024];
+__global__ void scan_block_3(int *data, int *out, int *values, int *block_sums){
+    __shared__ int chunk_data[1024];
 
     int start = 1024 * blockIdx.x;
     int tid = threadIdx.x;
     int gap = 1;
     int start_size = 1024 >> 1;
-
-//    out[start+(2*tid)] = 1; // for testing
-//    out[start+(2*tid+1)] = 2;
+    int temp_block_sum = 0;
 
     chunk_data[2*tid] = data[start+(2*tid)];
     chunk_data[2*tid+1] = data[start+(2*tid+1)];
+
+    if (threadIdx.x == 0){
+        temp_block_sum = chunk_data[1023];
+    }
 
     for (int span=start_size; span>0; span>>=1){
         __syncthreads();
@@ -85,8 +60,48 @@ __global__ void scan_block_3(int *data, int *out, int *values){
     }
     __syncthreads();
 
+    // write back to unified memory
     out[start+(2*tid)] = chunk_data[2*tid];
     out[start+(2*tid+1)] = chunk_data[2*tid+1];
+
+    // write to block sums
+    if (threadIdx.x == 0){
+        block_sums[blockIdx.x] += temp_block_sum + chunk_data[1023];
+    }
+}
+
+__global__ void apply_block_sum(int *data, int *out, int *values, int *block_sums){
+    //__shared__ float chunk_data[1024];
+//    __shared__ int val_to_add;
+    int tid = threadIdx.x;
+    int start = 1024 * blockIdx.x;
+    int ind_a = start+(tid*2);
+    int ind_b = start+(tid*2)+1;
+
+//    if (threadIdx.x == 0) {
+//        if (blockIdx.x == 0) {
+//            val_to_add = 0;
+//        } else {
+//            val_to_add = block_sums[blockIdx.x - 1];
+//        }
+//    }
+//    __syncthreads();
+    int val_to_add = block_sums[blockIdx.x];
+
+    out[ind_a] = data[ind_a] + val_to_add;
+    out[ind_b] = data[ind_b] + val_to_add;
+
+//    // place into shared
+//    chunk_data[2*tid] = data[start+(2*tid)];
+//    chunk_data[2*tid+1] = data[start+(2*tid+1)];
+//    __syncthreads();
+//
+//    chunk_data[]
+//
+//    __syncthreads();
+//    // write back to unified memory
+//    out[start+(2*tid)] = chunk_data[2*tid];
+//    out[start+(2*tid+1)] = chunk_data[2*tid+1];
 }
 
 //__global__ void down_sweep(int *data,int *output, int *values){
@@ -135,37 +150,67 @@ int main(int argc, char ** argv) {
     cudaEventCreate(&begin);
     cudaEventCreate(&end);
 
-    int * h_output = (int *)malloc(sizeof(int) * values); // THIS VARIABLE SHOULD HOLD THE TOTAL COUNT BY THE END
+    int * h_output = (int *)malloc(sizeof(int) * (values+zeros)); // THIS VARIABLE SHOULD HOLD THE TOTAL COUNT BY THE END
     // PERFORM NECESSARY VARIABLE DECLARATIONS HERE
-    int *data_p, *values_p, *intermediate;
+    int blocks = z_values/1024;
+    if (blocks % 1024 == 0){
+        zeros = 0;
+    } else {
+        zeros = 1024 - (blocks % 1024);
+    }
+    int blocks_padded = blocks + zeros;
+    printf("blocks padded: %i\n", blocks_padded);
+
+    int *data_p, *values_p, *intermediate, *num_blocks, *dummy, *block_sums, *block_sums_scanned;
+//    int * block_sums = (int *)malloc(sizeof(int) * blocks_padded);
+//    int * block_sums_scanned = (int *)malloc(sizeof(int) * blocks_padded);
+
     cudaMallocManaged(&values_p, sizeof(int));
+    cudaMallocManaged(&num_blocks, sizeof(int));
     cudaMallocManaged(&data_p, z_values * sizeof(int));
     cudaMallocManaged(&intermediate, z_values * sizeof(int));
     cudaMallocManaged(&h_output, z_values * sizeof(int));
+    cudaMallocManaged(&block_sums, blocks_padded * sizeof(int));
+    cudaMallocManaged(&block_sums_scanned, blocks_padded * sizeof(int));
+    cudaMallocManaged(&dummy, blocks_padded/1024 * sizeof(int));
 
     // PERFORM NECESSARY DATA TRANSFER HERE
     *values_p = z_values;
+    *num_blocks = z_values/1024;
     for (int i=0; i<z_values; i++){
         data_p[i] = data[i];
-//        h_output[i] = data[i];
-//        h_output[i] = 0;
+    }
+    for (int i=0; i<blocks_padded; i++){
+        block_sums[i] = 0;
+        block_sums_scanned[i] = 0;
     }
 
     cudaEventRecord(begin, stream);
 
     // LAUNCH KERNEL HERE
-    int threads_per_block = 512;
-    int elements_per_block = threads_per_block * reduc_thread_elements;
-    // ceiling of values / elements_per_block
-    int num_blocks = (values + elements_per_block - 1) / elements_per_block;
-    dim3 grid_dim_reduc(num_blocks, 1, 1);
-    dim3 block_dim_reduc(threads_per_block, 1, 1);
-//    parallel_reduc <<<grid_dim_reduc, block_dim_reduc>>> (data_p, h_output, values_p, );
-//    up_sweep <<<grid_dim, block_dim>>> (data_p, h_output, values_p);
-//    reduce <<<32, 32>>> (data_p, h_output);
-//    parallel_reduc_3 <<<z_values/1024, 512>>> (data_p, h_output, values_p);
-    scan_block_3 <<<z_values/1024, 512>>> (data_p, h_output, values_p);
-//    down_sweep <<<z_values/1024, 512>>> (intermediate, h_output, values_p);
+    // scan data in chunks of 1024
+    scan_block_3 <<<z_values/1024, 512>>> (data_p, intermediate, values_p, block_sums);
+    cudaDeviceSynchronize();
+//    printf("block0: %i\n", block_sums[0]);
+//    printf("block1: %i\n", block_sums[1]);
+//    printf("block1023: %i\n", block_sums[1023]);
+//    for (int i=0; i<blocks_padded; i++){
+//        if (block_sums[i] != 0){
+//            printf("nonzero: %i\n", block_sums[i]);
+//        }
+//    }
+    printf("checked all\n");
+
+    // scan block sums array
+    printf("blocks padded: %i\n", blocks_padded);
+    scan_block_3 <<<blocks_padded/1024, 512>>> (block_sums, block_sums_scanned, num_blocks, dummy);
+    cudaDeviceSynchronize();
+    printf("block0: %i\n", block_sums[0]);
+    printf("block1: %i\n", block_sums[1]);
+
+    // apply block sums to intermediate
+    apply_block_sum <<<z_values/1024, 512>>> (intermediate, h_output, values_p, block_sums_scanned);
+    cudaDeviceSynchronize();
     cudaEventRecord(end, stream);
 
     /* 
@@ -178,7 +223,7 @@ int main(int argc, char ** argv) {
     for (int i=0; i<15; i++){
         printf("data: %i\n", data[i]);
     }
-    for (int i=0; i<15; i++){
+    for (int i=61435; i<61451; i++){
         printf("out: %i\n", h_output[i]);
     }
     printf("first: %i\n", h_output[0]);
@@ -192,6 +237,9 @@ int main(int argc, char ** argv) {
     cudaFree(data_p);
     cudaFree(values_p);
     cudaFree(intermediate);
+    cudaFree(block_sums);
+    cudaFree(block_sums_scanned);
+    cudaFree(dummy);
 //    cudaFree(h_output);
 
 //    for (int i=0; i<values; i++){
